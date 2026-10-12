@@ -5,103 +5,64 @@ kfobserver.core.keling module
 Witness KEL fallback for pending observer TEL batches.
 """
 
-import time
 from urllib.parse import urlsplit, urlencode
 
-from hio.base import doing
+from hio.base import doing, tyming
 from hio.core import http
 from keri import help
 from keri.app.httping import CESR_CONTENT_TYPE, CESR_DESTINATION_HEADER
 
-from kfobserver.core.cooperative import responseDo
 from kfobserver.core.observing import ingestKel
 
 
 logger = help.ogler.getLogger()
 
 
-def _makeKelClient(issuer, url, aid=None, timeout=5.0):
-    """Create and start a witness KEL HTTP client."""
+def fetchKelDo(owner, issuer, url, aid=None, timeout=5.0):
+    """Cooperatively GET witness KEL; return CESR bytes or empty bytes."""
     if not issuer or not url:
-        return None
+        return b""
     purl = urlsplit(url)
-    base = purl.path or "/"
-    if not base.endswith("/"):
-        base = base + "/"
-    path = f"{base}log?{urlencode({'pre': issuer})}"
+    base = (purl.path or "/").rstrip("/")
+    path = f"{base}/log?{urlencode({'pre': issuer})}"
     headers = {"Accept": CESR_CONTENT_TYPE}
     if aid:
         headers[CESR_DESTINATION_HEADER] = aid
     client = http.clienting.Client(
         scheme=purl.scheme or "http",
         hostname=purl.hostname or "127.0.0.1",
-        port=purl.port or 80,
+        port=purl.port,
         portOptional=True,
-        timeout=timeout,
+        tymth=owner.tymth,
     )
-    client.request(method="GET", path=path, headers=headers)
-    return client
-
-
-def _kelResponseBody(response, issuer, url):
-    """Return a successful witness response body, logging failures."""
-    if response is None:
-        logger.info("witness KEL fetch failed for %s at %s", issuer, url)
-        return b""
-    if response.status != 200:
-        logger.info(
-            "witness KEL fetch %s %s returned HTTP %s",
-            issuer,
-            url,
-            response.status,
-        )
-        return b""
-    return bytes(response.body or b"")
-
-
-def fetchKelOnce(issuer, url, aid=None, timeout=5.0):
-    """GET ``/log?pre=`` from a witness and return KEL CESR bytes.
-
-    Parameters:
-        issuer (str): AID whose KEL to clone.
-        url (str): witness base URL (e.g. ``http://127.0.0.1:5642/``).
-        aid (str | None): witness AID for ``CESR-DESTINATION`` (required by
-            witness-hk ``KeyLogEnd``).
-        timeout (float): seconds to wait for a response.
-
-    Returns:
-        bytes: CESR KEL on HTTP 200; empty bytes on failure.
-    """
     try:
-        client = _makeKelClient(issuer, url, aid=aid, timeout=timeout)
-        if client is None:
-            return b""
-        deadline = time.monotonic() + float(timeout)
-        while not client.responses and time.monotonic() < deadline:
+        client.reopen()
+        client.request(method="GET", path=path, headers=headers)
+        tymer = tyming.Tymer(tymth=owner.tymth, duration=timeout)
+        while not tymer.expired:
+            try:
+                client.service()
+            except OSError as ex:  # Includes socket errors and ssl.SSLError.
+                logger.info("witness KEL fetch error for %s at %s: %s", issuer, url, ex)
+                return b""
+            if client.responses:
+                response = client.respond()
+                if response.status == 200:
+                    return bytes(response.body or b"")
+                logger.info(
+                    "witness KEL fetch %s %s returned HTTP %s",
+                    issuer,
+                    url,
+                    response.status,
+                )
+                return b""
             if client.respondent is not None and client.respondent.errored:
                 break
-            client.service()
-        if not client.responses:
-            logger.info("witness KEL fetch failed for %s at %s", issuer, url)
-            return b""
-        response = client.respond()
-    except Exception as ex:
-        logger.info("witness KEL fetch error for %s at %s: %s", issuer, url, ex)
+            yield b""
+        logger.info("witness KEL fetch failed for %s at %s", issuer, url)
         return b""
-    return _kelResponseBody(response, issuer, url)
-
-
-def fetchKelDo(owner, issuer, url, aid=None, timeout=5.0):
-    """Cooperatively GET ``/log?pre=`` from a witness."""
-    try:
-        client = _makeKelClient(issuer, url, aid=aid, timeout=timeout)
-        if client is None:
-            return b""
-        response = yield from responseDo(owner, client, timeout=timeout)
-    except Exception as ex:
-        logger.info("witness KEL fetch error for %s at %s: %s", issuer, url, ex)
-        return b""
-    return _kelResponseBody(response, issuer, url)
+    finally:
+        client.close()
 
 
 class WitnessKelFetcher(doing.DoDoer):
@@ -118,44 +79,37 @@ class WitnessKelFetcher(doing.DoDoer):
         self.observer = observer
         self.kvy = kvy
         self.witnesses = list(witnesses or [])
-        self.tock = float(tock)
+        self.interval = float(tock)
         self.timeout = 5.0
-        super(WitnessKelFetcher, self).__init__(
-            doers=[doing.doify(self.fetchDo, tock=self.tock)]
-        )
+        super(WitnessKelFetcher, self).__init__(doers=[doing.doify(self.fetchDo)])
 
     def fetchDo(self, tymth=None, tock=0.0, **kwa):
         """Periodic KEL fetch for pending issuers."""
         self.wind(tymth)
-        self.tock = tock if tock else self.tock
-        _ = yield self.tock
+        self.tock = tock
+        yield self.tock
         while True:
             for issuer in self.observer.pendingIssuers():
                 for wit in self.witnesses:
-                    try:
-                        raw = yield from fetchKelDo(
-                            self,
-                            issuer,
-                            wit.get("url"),
-                            aid=wit.get("aid"),
-                            timeout=self.timeout,
-                        )
-                        if raw:
-                            ingestKel(self.kvy, raw)
-                            moved = self.observer.retryPending()
-                            logger.info(
-                                "witness KEL for %s from %s: %s",
-                                issuer,
-                                wit.get("url"),
-                                moved,
-                            )
-                            if issuer not in self.observer.pendingIssuers():
-                                break
-                    except Exception as ex:
+                    raw = yield from fetchKelDo(
+                        self,
+                        issuer,
+                        wit.get("url"),
+                        aid=wit.get("aid"),
+                        timeout=self.timeout,
+                    )
+                    if raw:
+                        ingestKel(self.kvy, raw)
+                        moved = self.observer.retryPending()
                         logger.info(
-                            "witness KEL error for %s at %s: %s",
+                            "witness KEL for %s from %s: %s",
                             issuer,
                             wit.get("url"),
-                            ex,
+                            moved,
                         )
+                    if issuer not in self.observer.pendingIssuers():
+                        break
+            delay = tyming.Tymer(tymth=self.tymth, duration=self.interval)
             yield self.tock
+            while not delay.expired:
+                yield self.tock

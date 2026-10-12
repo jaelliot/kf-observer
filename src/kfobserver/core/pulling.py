@@ -5,53 +5,17 @@ kfobserver.core.pulling module
 Periodic bulk TEL pull from one or more kf-registrar external faces.
 """
 
-import time
 from urllib.parse import urlsplit
 
-from hio.base import doing
+from hio.base import doing, tyming
 from hio.core import http
 from keri import Vrsn_2_0, help
 from keri.app.httping import CESR_CONTENT_TYPE
 from keri.core import query
 from keri.help import helping
 
-from kfobserver.core.cooperative import responseDo
-
 
 logger = help.ogler.getLogger()
-
-
-def _makePullClient(hab, url, regk=None, sn=0, timeout=5.0):
-    """Create and start a registrar bulk HTTP client."""
-    serder = bulkQuery(hab, regk=regk, sn=sn)
-    body = bytes(hab.endorse(serder, last=True, framed=False, gvrsn=Vrsn_2_0))
-    purl = urlsplit(url)
-    path = purl.path or "/"
-    client = http.clienting.Client(
-        scheme=purl.scheme or "http",
-        hostname=purl.hostname or "127.0.0.1",
-        port=purl.port or 80,
-        portOptional=True,
-        timeout=timeout,
-    )
-    client.request(
-        method="POST",
-        path=path,
-        headers={"Content-Type": CESR_CONTENT_TYPE},
-        body=body,
-    )
-    return client
-
-
-def _responseBody(response, url):
-    """Return a successful registrar response body, logging HTTP failures."""
-    if response is None:
-        logger.info("registrar pull failed for %s", url)
-        return b""
-    if response.status != 200:
-        logger.info("registrar pull %s returned HTTP %s", url, response.status)
-        return b""
-    return bytes(response.body or b"")
 
 
 def bulkQuery(hab, regk=None, sn=0, route="tels/bulk"):
@@ -80,37 +44,46 @@ def bulkQuery(hab, regk=None, sn=0, route="tels/bulk"):
     )
 
 
-def pullOnce(hab, url, regk=None, sn=0, timeout=5.0):
-    """Synchronously POST one bulk query and return response body bytes.
-
-    Uses a short-lived hio HTTP client. Scheduled polling uses the cooperative
-    request path below instead.
-
-    Parameters:
-        hab (Hab): observer habitat (must be allow-listed on the registrar).
-        url (str): registrar external base URL (e.g. ``http://127.0.0.1:6632/``).
-        regk (str | list | None): optional registry filter.
-        sn (int): optional from-sn clone.
-        timeout (float): seconds to wait for a response.
-
-    Returns:
-        bytes: CESR body on HTTP 200; empty bytes on failure.
-    """
+def pullDo(owner, hab, url, regk=None, sn=0, timeout=5.0):
+    """Cooperatively POST a signed bulk query; return CESR bytes or empty bytes."""
+    serder = bulkQuery(hab, regk=regk, sn=sn)
+    body = bytes(hab.endorse(serder, last=True, framed=False, gvrsn=Vrsn_2_0))
+    purl = urlsplit(url)
+    client = http.clienting.Client(
+        scheme=purl.scheme or "http",
+        hostname=purl.hostname or "127.0.0.1",
+        port=purl.port,
+        portOptional=True,
+        tymth=owner.tymth,
+    )
     try:
-        client = _makePullClient(hab, url, regk=regk, sn=sn, timeout=timeout)
-        deadline = time.monotonic() + float(timeout)
-        while not client.responses and time.monotonic() < deadline:
+        client.reopen()
+        client.request(
+            method="POST",
+            path=purl.path or "/",
+            headers={"Content-Type": CESR_CONTENT_TYPE},
+            body=body,
+        )
+        tymer = tyming.Tymer(tymth=owner.tymth, duration=timeout)
+        while not tymer.expired:
+            try:
+                client.service()
+            except OSError as ex:  # Includes socket errors and ssl.SSLError.
+                logger.info("registrar pull error for %s: %s", url, ex)
+                return b""
+            if client.responses:
+                response = client.respond()
+                if response.status == 200:
+                    return bytes(response.body or b"")
+                logger.info("registrar pull %s returned HTTP %s", url, response.status)
+                return b""
             if client.respondent is not None and client.respondent.errored:
                 break
-            client.service()
-        if not client.responses:
-            logger.info("registrar pull failed for %s", url)
-            return b""
-        response = client.respond()
-    except Exception as ex:
-        logger.info("registrar pull error for %s: %s", url, ex)
+            yield b""
+        logger.info("registrar pull failed for %s", url)
         return b""
-    return _responseBody(response, url)
+    finally:
+        client.close()
 
 
 class RegistrarPuller(doing.DoDoer):
@@ -131,37 +104,25 @@ class RegistrarPuller(doing.DoDoer):
         self.urls = list(urls or [])
         self.regk = regk
         self.kvy = kvy
-        self.tock = float(tock)
+        self.interval = float(tock)
         self.timeout = 5.0
-        super(RegistrarPuller, self).__init__(
-            doers=[doing.doify(self.pullDo, tock=self.tock)]
-        )
+        super(RegistrarPuller, self).__init__(doers=[doing.doify(self.pullDo)])
 
     def pullDo(self, tymth=None, tock=0.0, **kwa):
         """Periodic full-clone pull from each registrar URL."""
         self.wind(tymth)
-        self.tock = tock if tock else self.tock
-        _ = yield self.tock
+        self.tock = tock
+        yield self.tock
         while True:
             for url in self.urls:
-                try:
-                    client = _makePullClient(
-                        self.hab,
-                        url,
-                        regk=self.regk,
-                        timeout=self.timeout,
-                    )
-                    response = yield from responseDo(self, client, timeout=self.timeout)
-                    raw = _responseBody(response, url)
-                    if raw:
-                        summary = self.observer.ingest(raw, kvy=self.kvy)
-                        logger.info(
-                            "pulled %s bytes from %s: %s",
-                            len(raw),
-                            url,
-                            summary,
-                        )
-                except Exception as ex:
-                    logger.info("registrar pull error for %s: %s", url, ex)
+                raw = yield from pullDo(
+                    self, self.hab, url, regk=self.regk, timeout=self.timeout
+                )
+                if raw:
+                    summary = self.observer.ingest(raw, kvy=self.kvy)
+                    logger.info("pulled %s bytes from %s: %s", len(raw), url, summary)
             self.observer.retryPending()
+            delay = tyming.Tymer(tymth=self.tymth, duration=self.interval)
             yield self.tock
+            while not delay.expired:
+                yield self.tock

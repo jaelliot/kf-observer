@@ -8,16 +8,19 @@ KEL/TEL split, KEL ingest, and witness fallback helpers.
 from keri import Vrsn_2_0
 from keri.acdc import acdcmap, blindate, regcept
 from keri.app.habbing import openHab, openHby
-from keri.core import Blinder, Kevery
+from keri.core import Blinder, Kevery, Parser
 from keri.core.signing import Salter
+import ssl
+from types import SimpleNamespace
+
+import falcon
 from hio.base import doing
 from hio.base.doing import Doist
-from hio.core import http
+from hio.core import http, tcp
 import pytest
 
-from kfobserver.core import keling
-from kfobserver.core.cooperative import responseDo
-from kfobserver.core.keling import WitnessKelFetcher, fetchKelOnce
+from kfobserver.core import keling, pulling
+from kfobserver.core.keling import WitnessKelFetcher
 from kfobserver.core.pulling import RegistrarPuller
 from kfobserver.core.observing import Observer, ingestKel, splitKelTel
 
@@ -51,9 +54,7 @@ def test_split_kel_tel_and_ingest_across_haberies():
             regid=rip.said,
             attribute=dict(d="", name="presentation"),
         )
-        blinder = Blinder.blind(
-            acdc=acdc.said, state="issued", salt=SALT, sn=1
-        )
+        blinder = Blinder.blind(acdc=acdc.said, state="issued", salt=SALT, sn=1)
         bup = blindate(
             regid=rip.said,
             prior=rip.said,
@@ -109,103 +110,6 @@ def test_ingest_kel_bytes_into_observer_baser():
         kvy = Kevery(db=hby.db, lax=True, local=False)
         ingestKel(kvy, kel)
         assert issuer in hby.kevers
-
-    # Unreachable witness returns empty without raising.
-    assert fetchKelOnce(issuer, "http://127.0.0.1:1/", aid=issuer, timeout=0.05) == b""
-
-
-def test_cooperative_http_wait_allows_other_scheduled_work_to_advance():
-    """An unfinished HTTP response yields control to unrelated doers."""
-
-    class NoResponseClient:
-        responses = []
-        respondent = None
-
-    class Harness(doing.DoDoer):
-        def __init__(self):
-            self.progress = 0
-            self.response = "waiting"
-            super().__init__(
-                doers=[
-                    doing.doify(self.requestDo),
-                    doing.doify(self.independentDo),
-                ],
-                always=True,
-            )
-
-        def requestDo(self, tymth=None, tock=0.1, **kwa):
-            self.wind(tymth)
-            client = NoResponseClient()
-            self.response = yield from responseDo(
-                self, client, timeout=0.3, clientDoer=doing.Doer(tock=0.1)
-            )
-
-        def independentDo(self, tymth=None, tock=0.1, **kwa):
-            self.wind(tymth)
-            while True:
-                self.progress += 1
-                yield tock
-
-    harness = Harness()
-    Doist(tock=0.1, real=False, limit=0.7).do(doers=[harness])
-    assert harness.progress >= 3
-    assert harness.response is None
-
-
-def test_registrar_pull_http_wait_does_not_stall_other_doers(monkeypatch):
-    """The scheduled registrar pull services HTTP cooperatively."""
-    progress = [0]
-    serviceProgress = []
-
-    class NoResponseClient:
-        responses = []
-        respondent = None
-
-        def __init__(self, **kwa):
-            pass
-
-        def request(self, **kwa):
-            pass
-
-        def wind(self, tymth):
-            pass
-
-        def reopen(self):
-            pass
-
-        def service(self):
-            serviceProgress.append(progress[0])
-
-        def close(self):
-            pass
-
-    class ObserverStub:
-        def ingest(self, raw, kvy=None):
-            raise AssertionError("an unanswered request has no response body")
-
-        def retryPending(self):
-            return {}
-
-    monkeypatch.setattr(http.clienting, "Client", NoResponseClient)
-
-    def independentDo(tymth=None, tock=0.1, **kwa):
-        while True:
-            progress[0] += 1
-            yield tock
-
-    with openHab(name="obs-pull-coop", temp=True, version=Vrsn_2_0) as (_hby, hab):
-        puller = RegistrarPuller(
-            hab=hab,
-            observer=ObserverStub(),
-            urls=["http://registrar/"],
-            tock=0.1,
-        )
-        Doist(tock=0.1, real=False, limit=0.8).do(
-            doers=[puller, doing.doify(independentDo, tock=0.1)]
-        )
-
-    assert serviceProgress
-    assert len(set(serviceProgress)) > 1
 
 
 def test_stale_witness_response_falls_through_to_witness_with_anchor(monkeypatch):
@@ -265,6 +169,7 @@ def test_stale_witness_response_falls_through_to_witness_with_anchor(monkeypatch
     [
         ((b"required-kel", b"unused"), ["http://first/"], False),
         ((b"stale-kel", b"stale-kel"), ["http://first/", "http://second/"], True),
+        ((b"", b""), ["http://first/", "http://second/"], True),
     ],
 )
 def test_witness_search_stops_on_state_or_after_all_witnesses(
@@ -317,3 +222,223 @@ def test_witness_search_stops_on_state_or_after_all_witnesses(
 
     assert requested == expected_urls
     assert observer.pending is pending_after_pass
+
+
+@pytest.mark.parametrize("kind", ["registrar", "witness"])
+def test_default_poll_services_http_and_delays_between_passes(monkeypatch, kind):
+    """Real clients finish at scheduler cadence; the next pass waits five seconds."""
+    doist = Doist(tock=0.03125, real=False, limit=10.0)
+    requested = []
+    completed = []
+    progress = []
+    closed = []
+    originalClose = http.clienting.Client.close
+
+    def close(client):
+        closed.append(client)
+        originalClose(client)
+
+    monkeypatch.setattr(http.clienting.Client, "close", close)
+
+    class Peer:
+        def on_post(self, req, rep):
+            raw = req.bounded_stream.read()
+            dom = Parser(version=Vrsn_2_0).parseOne(
+                ims=bytearray(raw), framed=True, processive=False
+            )
+            assert req.content_type == pulling.CESR_CONTENT_TYPE
+            assert dom.serder.ked["r"] == "tels/bulk"
+            assert dom.serder.ked["i"] == hab.pre
+            assert dom.serder.ked["q"] == {"i": "registry"}
+            assert dom.serder.pvrsn == Vrsn_2_0
+            assert dom.lsgs
+            assert raw == bytes(
+                hab.endorse(dom.serder, last=True, framed=False, gvrsn=Vrsn_2_0)
+            )
+            self.respond(rep)
+
+        def on_get(self, req, rep):
+            assert req.path == "/log"
+            assert req.get_param("pre") == "issuer"
+            assert req.get_header("Accept") == keling.CESR_CONTENT_TYPE
+            assert req.get_header(keling.CESR_DESTINATION_HEADER) == "witness-aid"
+            self.respond(rep)
+
+        def respond(self, rep):
+            requested.append(doist.tyme)
+
+            def delayed():
+                for _ in range(3):
+                    yield b""
+                yield b"cesr"
+
+            rep.stream = delayed()
+
+    class ObserverStub:
+        def pendingIssuers(self):
+            return ["issuer"]
+
+        def retryPending(self):
+            if kind == "witness":
+                completed.append(doist.tyme)
+            return {}
+
+        def ingest(self, raw, kvy=None):
+            assert raw == b"cesr"
+            completed.append(doist.tyme)
+            return {}
+
+    def independentDo(tymth=None, tock=0.0, **kwa):
+        while True:
+            progress.append(tymth())
+            yield tock
+
+    app = falcon.App()
+    app.add_route("/", Peer())
+    app.add_route("/log", Peer())
+    with openHab(name="default-poll", temp=True, version=Vrsn_2_0) as (_hby, hab):
+        with http.serving.openServer(
+            servant=tcp.Server(ha=("127.0.0.1", 0)), app=app
+        ) as server:
+            server.servant.eha = server.servant.ha
+            url = f"http://127.0.0.1:{server.servant.ha[1]}/"
+            observer = ObserverStub()
+            if kind == "registrar":
+                poller = RegistrarPuller(hab, observer, urls=[url], regk="registry")
+            else:
+                poller = WitnessKelFetcher(
+                    observer, object(), witnesses=[{"url": url, "aid": "witness-aid"}]
+                )
+                # The network request is real; these bytes stand in for a KEL here.
+                monkeypatch.setattr(keling, "ingestKel", lambda kvy, raw: None)
+            doist.do(
+                doers=[http.ServerDoer(server), poller, doing.doify(independentDo)]
+            )
+    assert len(requested) >= 2
+    assert len(requested) == len(completed)
+    assert completed[0] - requested[0] < 1.0
+    assert requested[1] - completed[0] >= 5.0
+    assert len([t for t in progress if requested[0] <= t <= completed[0]]) >= 3
+    assert poller.interval == 5.0
+    assert len(closed) == len(completed)
+    assert all(client.connector.cs is None for client in closed)
+
+
+@pytest.mark.parametrize("kind", ["registrar", "witness"])
+@pytest.mark.parametrize("failure", ["timeout", "tls", "socket", "http", "parse"])
+def test_request_failure_cleans_up_and_scheduler_continues(monkeypatch, kind, failure):
+    """Transport failures stay inside the request and a later poll still runs."""
+    doist = Doist(tock=0.03125, real=False, limit=5.75)
+    serviced = []
+    closed = []
+    progress = []
+    originalService = http.clienting.Client.service
+    originalClose = http.clienting.Client.close
+
+    def service(client):
+        serviced.append((client, doist.tyme, len(progress)))
+        if failure == "tls":
+            raise ssl.SSLCertVerificationError(1, "certificate verify failed")
+        if failure == "socket":
+            raise ConnectionResetError("connection reset by peer")
+        if failure == "http":
+            client.responses.append(
+                dict(
+                    version=(1, 1),
+                    status=503,
+                    reason="Service Unavailable",
+                    headers={},
+                    body=b"error",
+                    data=None,
+                    request={},
+                    errored=False,
+                    error=None,
+                )
+            )
+        if failure == "parse":
+            client.respondent.errored = True
+        if failure == "timeout":
+            # Exercise the actual service path with no response for this request.
+            originalService(client)
+
+    def close(client):
+        closed.append((client, doist.tyme))
+        originalClose(client)
+
+    monkeypatch.setattr(http.clienting.Client, "service", service)
+    monkeypatch.setattr(http.clienting.Client, "close", close)
+
+    class ObserverStub:
+        def pendingIssuers(self):
+            return ["issuer"]
+
+        def retryPending(self):
+            return {}
+
+        def ingest(self, raw, kvy=None):
+            raise AssertionError("failed request must not be ingested")
+
+    def independentDo(tymth=None, tock=0.0, **kwa):
+        while True:
+            progress.append(tymth())
+            yield tock
+
+    with openHab(name="failure-poll", temp=True, version=Vrsn_2_0) as (_hby, hab):
+        app = falcon.App()  # Keep a listener open without ever servicing responses.
+        with http.serving.openServer(
+            servant=tcp.Server(ha=("127.0.0.1", 0)), app=app
+        ) as server:
+            server.servant.eha = server.servant.ha
+            url = f"http://127.0.0.1:{server.servant.ha[1]}/"
+            if kind == "registrar":
+                poller = RegistrarPuller(hab, ObserverStub(), urls=[url])
+            else:
+                poller = WitnessKelFetcher(
+                    ObserverStub(), object(), witnesses=[{"url": url}]
+                )
+            poller.timeout = 0.25
+            doist.do(doers=[poller, doing.doify(independentDo)])
+    assert len({id(client) for client, _, _ in serviced}) >= 2
+    assert {id(client) for client, _, _ in serviced} == {
+        id(client) for client, _ in closed
+    }
+    assert progress[-1] > closed[0][1]
+    if failure == "timeout":
+        first = serviced[0][0]
+        turns = [turn for client, _, turn in serviced if client is first]
+        assert len(set(turns)) >= 3
+        assert 0.25 <= closed[0][1] - serviced[0][1] < 0.5
+
+
+@pytest.mark.parametrize("kind", ["registrar", "witness"])
+def test_request_cancellation_closes_client(monkeypatch, kind):
+    """Closing a suspended domain coroutine releases its real client."""
+    clients = []
+    originalClose = http.clienting.Client.close
+
+    def close(client):
+        clients.append(client)
+        originalClose(client)
+
+    monkeypatch.setattr(http.clienting.Client, "close", close)
+    owner = SimpleNamespace(tymth=lambda: 0.0)
+    with openHab(name="cancel-pull", temp=True, version=Vrsn_2_0) as (_hby, hab):
+        if kind == "registrar":
+            request = pulling.pullDo(
+                owner, hab, "http://127.0.0.1:1/", regk="registry", sn=2
+            )
+        else:
+            request = keling.fetchKelDo(owner, "issuer", "http://127.0.0.1:1/")
+        assert next(request) == b""
+        request.close()
+        if kind == "registrar":
+            raw = bytes(clients[0].requester.body)
+            dom = Parser(version=Vrsn_2_0).parseOne(
+                ims=bytearray(raw), framed=True, processive=False
+            )
+            assert dom.serder.ked["q"] == {"i": "registry", "sn": 2}
+            assert raw == bytes(
+                hab.endorse(dom.serder, last=True, framed=False, gvrsn=Vrsn_2_0)
+            )
+    assert len(clients) == 1
+    assert clients[0].connector.cs is None

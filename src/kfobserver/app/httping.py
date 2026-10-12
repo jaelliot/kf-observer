@@ -8,10 +8,15 @@ Falcon resources for the wallet/verifier verified-TEL query face.
 import json
 
 import falcon
+from hio.help import helping as hiohelping
 from keri import Vrsn_2_0
 from keri.app.httping import CESR_ATTACHMENT_HEADER, CESR_CONTENT_TYPE
 from keri.core import Number, Parser, SerderKERI
-from keri.kering import MissingAuthAttachmentError, MissingSenderKeyStateError
+from keri.kering import (
+    InvalidValueError,
+    MissingAuthAttachmentError,
+    MissingSenderKeyStateError,
+)
 
 
 # Fine-grained wallet/verifier routes (one registry SAID).
@@ -104,7 +109,9 @@ class TelQueryEnd:
             raise falcon.HTTPBadRequest(description="unable to parse signed query")
         serder = dom.serder
         if serder.ilk != "qry":
-            raise falcon.HTTPBadRequest(description="observer face accepts qry messages only")
+            raise falcon.HTTPBadRequest(
+                description="observer face accepts qry messages only"
+            )
 
         route = serder.ked.get("r", "")
         qry = serder.ked.get("q") or {}
@@ -116,7 +123,9 @@ class TelQueryEnd:
                 description="bulk registrar routes are not served by the observer"
             )
         if route not in QUERY_ROUTES:
-            raise falcon.HTTPForbidden(description=f"invalid observer query route {route}")
+            raise falcon.HTTPForbidden(
+                description=f"invalid observer query route {route}"
+            )
         if "vcid" in qry:
             raise falcon.HTTPForbidden(
                 description="credential SAID queries are not served; use registry SAID"
@@ -146,10 +155,32 @@ class TelQueryEnd:
             raise falcon.HTTPBadRequest(
                 description="q.i must be a single registry SAID"
             )
-        if not self.ctx.observer.hasRegistry(regk):
-            # IPEX timing: holder may have just published; pull that SAID now.
-            if self.ctx.registrars:
-                self.ctx.pullRegistry(regk)
+        if not self.ctx.observer.hasRegistry(regk) and self.ctx.registrars:
+            # HIO advances the stream cooperatively and defers status until data.
+            rep.stream = self.queryDo(regk, route, qry)
+            return
+        data = self.queryData(regk, route, qry)
+        rep.set_header("Content-Type", CESR_CONTENT_TYPE)
+        rep.status = falcon.HTTP_200
+        rep.data = data
+
+    @hiohelping.attributize
+    def queryDo(self, me, regk, route, qry):
+        """Defer the TEL response while HIO services the registrar request."""
+        yield from self.ctx.pullRegistry(regk)
+        try:
+            data = self.queryData(regk, route, qry)
+        except falcon.HTTPError as ex:
+            me._status = ex.status
+            me._headers = {"Content-Type": "application/json"}
+            yield ex.to_json()
+        else:
+            me._status = falcon.HTTP_200
+            me._headers = {"Content-Type": CESR_CONTENT_TYPE}
+            yield data
+
+    def queryData(self, regk, route, qry):
+        """Read verified TEL or retain the existing missing/pending response."""
         if not self.ctx.observer.hasRegistry(regk):
             if regk in self.ctx.observer.pending:
                 raise falcon.HTTPServiceUnavailable(
@@ -160,11 +191,10 @@ class TelQueryEnd:
             raise falcon.HTTPNotFound(description=f"unknown registry {regk}")
 
         if route == "tels/head":
-            data = self.ctx.observer.lastRaw(regk)
-        else:
+            return self.ctx.observer.lastRaw(regk)
+        try:
             sn = _snFromQuery(qry)
-            data = self.ctx.observer.clone(regk, sn=sn)
-
-        rep.set_header("Content-Type", CESR_CONTENT_TYPE)
-        rep.status = falcon.HTTP_200
-        rep.data = data
+        except InvalidValueError as ex:
+            # Keep Falcon's existing 500 response even when rendering is deferred.
+            raise falcon.HTTPInternalServerError() from ex
+        return self.ctx.observer.clone(regk, sn=sn)
